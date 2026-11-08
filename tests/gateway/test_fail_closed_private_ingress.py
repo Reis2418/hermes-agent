@@ -27,6 +27,18 @@ HOOK = "post_gateway_admission"
 
 ROUTE = {"platform": "whatsapp", "scope_id": "155500000000000000@s.whatsapp.net",
          "user_id": "155500000000000000@s.whatsapp.net"}
+DISCORD_CATEGORY_ROUTE = {"platform": "discord", "scope_id": "234567890123456789",
+                          "user_id": "123456789012345678", "category_id": "345678901234567890"}
+
+
+def test_discord_category_route_parses_without_widening_to_whole_guild():
+    route = GatewayConfig.from_dict({
+        "fail_closed_consumer_routes": [dict(DISCORD_CATEGORY_ROUTE)]
+    }).fail_closed_consumer_routes[0]
+    assert route.category_id == DISCORD_CATEGORY_ROUTE["category_id"]
+    assert GatewayConfig.from_dict(GatewayConfig(
+        fail_closed_consumer_routes=[dict(DISCORD_CATEGORY_ROUTE)]).to_dict()
+    ).fail_closed_consumer_routes == [route]
 
 
 def _register(callback) -> None:
@@ -71,6 +83,131 @@ def _event(text="private journal line", profile=None, scope_id=None, user_id=Non
         user_name="owner", chat_type=chat_type, profile=profile,
     )
     return MessageEvent(text=text, message_id="m1", source=source)
+
+
+def _discord_event(category_id, *, thread=False, text="synthetic content"):
+    channel = SimpleNamespace(id="456789012345678901", category_id=category_id)
+    if thread:
+        channel = SimpleNamespace(id="567890123456789012", parent_id=channel.id,
+                                  parent=channel)
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id=str(channel.id),
+        user_id=DISCORD_CATEGORY_ROUTE["user_id"],
+        scope_id=DISCORD_CATEGORY_ROUTE["scope_id"],
+        chat_type="thread" if thread else "group",
+        thread_id=str(channel.id) if thread else None,
+        parent_chat_id=str(channel.parent_id) if thread else None,
+    )
+    return MessageEvent(text=text, message_id="m2", source=source,
+                        raw_message=SimpleNamespace(channel=channel))
+
+
+@pytest.mark.asyncio
+async def test_category_policy_real_discord_shape_keeps_other_category_ordinary():
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    runner._hm_estop_gate = lambda *_a, **_k: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value="ordinary path")
+    channel = SimpleNamespace(id="456789012345678901", category_id=999999999999999999)
+    event = _discord_event(None)
+    event.raw_message = SimpleNamespace(channel=channel)
+    assert await runner._handle_message(event) == "ordinary path"
+    runner._hm_pending_reply_intercepts.assert_awaited_once()
+
+
+def test_category_policy_real_discord_shape_resolves_forum_thread():
+    from gateway.private_ingress import discord_category_of_channel
+    forum = SimpleNamespace(id=456789012345678901,
+                            category_id=int(DISCORD_CATEGORY_ROUTE["category_id"]))
+    thread = SimpleNamespace(id=567890123456789012, parent_id=forum.id, parent=forum)
+    assert discord_category_of_channel(
+        thread, is_thread=True, parent_chat_id=str(forum.id),
+        scope_id=DISCORD_CATEGORY_ROUTE["scope_id"],
+    ) == DISCORD_CATEGORY_ROUTE["category_id"]
+
+
+@pytest.mark.asyncio
+async def test_category_policy_keeps_known_unrelated_discord_channel_on_ordinary_path():
+    offered = []
+    _register(lambda **_kw: offered.append("offered") or {"action": "handled", "reply": "journal"})
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    runner._hm_estop_gate = lambda *_a, **_k: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value="ordinary path")
+    reply = await runner._handle_message(_discord_event("999999999999999999"))
+    assert reply == "ordinary path"
+    assert offered == []
+    runner._hm_pending_reply_intercepts.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_category_policy_refuses_protected_discord_channel_when_hook_absent():
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    _sealed_past_gate(runner)
+    assert await runner._handle_message(_discord_event(DISCORD_CATEGORY_ROUTE["category_id"])) \
+        == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_category_policy_pinned_unknown_never_becomes_ordinary_after_cache_update():
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    _sealed_past_gate(runner)
+    event = _discord_event("999999999999999999")
+    event.source.discord_category_pinned = True
+    event.source.discord_category_id = None  # missing at receipt, cache filled later
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_category_policy_uses_receipt_snapshot_after_channel_moves():
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    _sealed_past_gate(runner)
+    event = _discord_event("999999999999999999")  # cached channel moved after receipt
+    event.source.discord_category_id = DISCORD_CATEGORY_ROUTE["category_id"]
+    event.source.discord_category_pinned = True
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+def test_discord_category_snapshot_cannot_be_forged_over_source_wire():
+    source = _discord_event(DISCORD_CATEGORY_ROUTE["category_id"]).source
+    source.discord_category_id = "999999999999999999"
+    encoded = source.to_dict()
+    assert "discord_category_id" not in encoded
+    assert "discord_category_pinned" not in encoded
+    encoded["discord_category_id"] = "999999999999999999"
+    encoded["discord_category_pinned"] = True
+    restored = SessionSource.from_dict(encoded)
+    assert restored.discord_category_id is None
+    assert restored.discord_category_pinned is False
+
+
+@pytest.mark.asyncio
+async def test_category_policy_unknown_or_mismatched_channel_never_falls_through():
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    _sealed_past_gate(runner)
+    event = _discord_event("999999999999999999")
+    event.raw_message = None  # Restored or synthetic event with no trusted category metadata.
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+    event = _discord_event("999999999999999999")
+    event.raw_message.channel.id = "not-the-source-channel"
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_category_policy_uses_cached_guild_parent_when_thread_parent_object_missing():
+    runner = _runner(routes=[dict(DISCORD_CATEGORY_ROUTE)])
+    runner._hm_estop_gate = lambda *_a, **_k: None
+    runner._hm_pending_reply_intercepts = AsyncMock(return_value="ordinary thread")
+    event = _discord_event("999999999999999999", thread=True)
+    parent = event.raw_message.channel.parent
+    event.raw_message.channel.parent = None
+    event.raw_message.channel.guild = SimpleNamespace(
+        id=int(DISCORD_CATEGORY_ROUTE["scope_id"]),
+        get_channel=lambda channel_id: parent if str(channel_id) == str(parent.id) else None)
+    assert await runner._handle_message(event) == "ordinary thread"
+    runner._hm_pending_reply_intercepts.assert_awaited_once()
 
 
 @pytest.fixture(autouse=True)

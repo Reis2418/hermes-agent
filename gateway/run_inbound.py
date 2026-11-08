@@ -202,7 +202,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         routes = getattr(_config, "fail_closed_consumer_routes", None)
         if not is_internal and routes:
             from gateway.private_ingress import match_fail_closed_route, source_route_identity
-            private_origin = (match_fail_closed_route(routes, source),
+            private_origin = (match_fail_closed_route(routes, source, event),
                               source_route_identity(source))
 
         # An admission the authority is executing is already ordered by its durable FIFO; parking it

@@ -713,7 +713,8 @@ class GatewayConfig:
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
             "fail_closed_consumer_routes": [
-                asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
+                ({k: v for k, v in asdict(r).items() if k != "category_id" or v is not None}
+                 if is_dataclass(r) and not isinstance(r, type) else r)
                 for r in self.fail_closed_consumer_routes
             ],
             "streaming": self.streaming.to_dict(),

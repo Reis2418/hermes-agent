@@ -1697,7 +1697,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                         parent_id = str(message.channel.parent_id)
                     free_channels = self._discord_free_response_channels()
                     channel_keys = self._discord_channel_keys(message, parent_id)
-                    if "*" not in free_channels and not (channel_keys & free_channels):
+                    if ("*" not in free_channels and not (channel_keys & free_channels)
+                            and not self._discord_is_free_response_category(message.channel, free_channels)):
                         # Every other silent return in this function is at least guessable from
                         # the outside; this one is not, and an operator seeing no log line cannot
                         # tell it apart from the gateway never receiving the event.
@@ -2527,6 +2528,7 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 self._discord_require_mention()
                 and "*" not in free_channels
                 and not (channel_keys & free_channels)
+                and not self._discord_is_free_response_category(message.channel, free_channels)
                 and not self._in_bot_thread(message)
                 and not self._self_is_explicitly_mentioned(message)
             ):
@@ -4791,6 +4793,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             guild_id=self._interaction_guild_id(interaction), parent_chat_id=parent_id or None,
             role_authorized=self._slash_role_grant(interaction),
         )
+        from gateway.private_ingress import discord_category_of_channel
+        source.discord_category_id = discord_category_of_channel(
+            interaction.channel, is_thread=is_thread, parent_chat_id=parent_id or None,
+            scope_id=source.scope_id,
+        )
+        source.discord_category_pinned = True
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
         return MessageEvent(
@@ -4846,6 +4854,12 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             guild_id=self._interaction_guild_id(interaction), parent_chat_id=_parent_id or None,
             role_authorized=self._slash_role_grant(interaction),
         )
+        from gateway.private_ingress import discord_category_of_channel
+        source.discord_category_id = discord_category_of_channel(
+            thread, is_thread=True, parent_chat_id=_parent_id or None,
+            scope_id=source.scope_id,
+        )
+        source.discord_category_pinned = True
         _skills = self._resolve_channel_skills(thread_id, _parent_id or None)
         _channel_prompt = self._resolve_channel_prompt(thread_id, _parent_id or None)
         event = MessageEvent(
@@ -5121,6 +5135,17 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         return self._extra_or_env_flag(
             "bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION", "true", truthy=True
         )
+
+    def _discord_is_free_response_category(self, channel: Any, free_channels: set[str]) -> bool:
+        """One category opt-in shared by live admission and recovered-message gates."""
+        from gateway.private_ingress import discord_category_of_channel
+        is_thread = isinstance(channel, discord.Thread)
+        category_id = discord_category_of_channel(
+            channel, is_thread=is_thread,
+            parent_chat_id=self._get_parent_channel_id(channel) if is_thread else None,
+            scope_id=str(getattr(getattr(channel, "guild", None), "id", "")) or None,
+        )
+        return bool(category_id and category_id in free_channels)
 
     def _discord_channel_keys(self, message: Any, parent_channel_id: Optional[str] = None) -> set[str]:
         """Channel keys (ID, bare name, ``#name``, plus parent for threads) accepted by channel gates."""
@@ -6088,6 +6113,13 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
         if is_thread:
             thread_id = str(message.channel.id)
             parent_channel_id = self._get_parent_channel_id(message.channel)
+        # Pin membership before the first await (thread creation, media caching, batching).
+        # Discord may update a cached channel's parent in place after a category move.
+        from gateway.private_ingress import discord_category_of_channel
+        receipt_category_id = discord_category_of_channel(
+            message.channel, is_thread=is_thread, parent_chat_id=parent_channel_id,
+            scope_id=str(message.guild.id) if getattr(message, "guild", None) else None,
+        )
         is_voice_linked_channel = False
         # Save stripped text now: create_thread() can clobber message.content (breaks /command detection).
         raw_content = message.content.strip()
@@ -6132,6 +6164,9 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
             is_free_channel = (
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
+                # discord.py exposes a TextChannel's category_id, not parent_id.
+                # Keep other channel gates unchanged; only opt-in free response uses a category.
+                or bool(receipt_category_id and receipt_category_id in free_channels)
                 or is_voice_linked_channel
             )
             in_bot_thread = self._in_bot_thread(message)
@@ -6229,6 +6264,8 @@ class DiscordAdapter(DiscordAuthorizationMixin, DiscordMediaMixin, DiscordThread
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
         )
+        source.discord_category_id = receipt_category_id
+        source.discord_category_pinned = True
         media_urls, media_types, media_text_inlined, pending_text_injection = await self._collect_attachment_media(
             all_attachments)
         event_text = normalized_content

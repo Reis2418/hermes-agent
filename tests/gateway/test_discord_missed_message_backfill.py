@@ -252,6 +252,19 @@ async def test_repeated_ready_coalesces_instead_of_cancelling_active_recovery(ad
 
 
 @pytest.mark.asyncio
+async def test_recovered_unmentioned_message_in_category_free_response_is_dispatched(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "345678901234567890")
+    channel = FakeChannel(channel_id=456789012345678901)
+    channel.category_id = 345678901234567890
+    message = make_message(message_id=567890123456789012, channel=channel,
+                           content="Private synthetic journal entry")
+    assert await adapter._dispatch_recovered_message(message) is True
+    adapter._handle_message.assert_awaited_once_with(
+        message, role_authorized=False, recovered=True)
+
+
+@pytest.mark.asyncio
 async def test_recovered_mention_reuses_live_auth_and_mention_gates(adapter, monkeypatch):
     bot_user = adapter._client.user
     monkeypatch.delenv("DISCORD_ALLOW_ALL_USERS", raising=False)

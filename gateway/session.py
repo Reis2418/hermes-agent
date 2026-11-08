@@ -85,6 +85,11 @@ class SessionSource:
     scope_id: Optional[str] = None
     guild_id: Optional[str] = None
     parent_chat_id: Optional[str] = None  # parent channel when chat_id is a thread
+    # Discord adapter's receipt-time category snapshot. Wire-invisible: an upstream
+    # serialized source may not claim an unrelated category to bypass private ingress.
+    # None = unknown (fail closed), "" = verified uncategorized, ID = category.
+    discord_category_id: Optional[str] = field(default=None, repr=False, compare=False)
+    discord_category_pinned: bool = field(default=False, repr=False, compare=False)
     message_id: Optional[str] = None  # triggering message (pin/reply/react)
     role_authorized: bool = False  # adapter granted access via role, not user ID
     # Multiplex profile this message routes to (None => active/default); namespaces the key.

@@ -69,6 +69,16 @@ def test_third_party_mention_in_bot_thread_is_admitted(monkeypatch):
     assert admitted is False
 
 
+def test_third_party_mention_in_category_free_response_channel_is_admitted(monkeypatch):
+    monkeypatch.delenv("DISCORD_IGNORE_NO_MENTION", raising=False)
+    adapter = _adapter()
+    adapter._discord_free_response_channels = Mock(return_value={"345678901234567890"})
+    channel = SimpleNamespace(id=THREAD_ID, category_id=345678901234567890)
+    admitted, _ = adapter._discord_message_admission(
+        _mentions_third_party(channel), claim=False)
+    assert admitted is True
+
+
 def test_third_party_mention_in_a_plain_channel_is_still_dropped_and_logged(monkeypatch, caplog):
     # Outside a bot thread the gate keeps its meaning (don't barge into a conversation
     # addressed to someone else) and now says so, instead of dropping silently.

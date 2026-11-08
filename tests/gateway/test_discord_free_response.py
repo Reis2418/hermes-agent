@@ -66,6 +66,7 @@ class FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name)
         self.topic = None
+        self.category_id = None  # discord.py TextChannel's actual category attribute
 
     def history(self, *, limit, before, after=None, oldest_first=None):
         async def _iter():
@@ -186,6 +187,70 @@ class FakeHistoryChannel(FakeTextChannel):
                 yield message
 
         return _iter()
+
+
+@pytest.mark.asyncio
+async def test_discord_thread_starter_pins_parent_category(adapter):
+    parent = FakeTextChannel(channel_id=456789012345678901)
+    parent.category_id = 345678901234567890
+    thread = FakeThread(channel_id=567890123456789012, parent=parent)
+    user = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
+    interaction = SimpleNamespace(channel=parent, channel_id=parent.id,
+                                  user=user, guild_id=234567890123456789)
+    adapter._slash_role_grant = lambda _interaction: False
+    await adapter._dispatch_thread_session(interaction, thread, "Private synthetic journal entry")
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.discord_category_pinned is True
+    assert event.source.discord_category_id == "345678901234567890"
+
+
+def test_discord_slash_event_pins_category_before_gateway_dispatch(adapter):
+    channel = FakeTextChannel(channel_id=456789012345678901)
+    channel.category_id = 345678901234567890
+    user = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
+    interaction = SimpleNamespace(channel=channel, channel_id=channel.id,
+                                  user=user, guild_id=234567890123456789)
+    adapter._slash_role_grant = lambda _interaction: False
+    event = adapter._build_slash_event(interaction, "/help")
+    assert event.source.discord_category_pinned is True
+    assert event.source.discord_category_id == "345678901234567890"
+
+
+@pytest.mark.asyncio
+async def test_discord_category_snapshot_precedes_async_media_and_channel_moves(adapter, monkeypatch):
+    """A channel moved during an await must not downgrade an already-private message."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    channel = FakeTextChannel(channel_id=456789012345678901)
+    channel.category_id = 345678901234567890
+    message = make_message(channel=channel, content="Private synthetic journal entry")
+
+    async def move_channel(_attachments):
+        channel.category_id = 999999999999999999
+        return [], [], [], None
+
+    adapter._collect_attachment_media = move_channel
+    assert await adapter._handle_message(message) is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.discord_category_id == "345678901234567890"
+    assert channel.category_id == 999999999999999999
+
+
+@pytest.mark.asyncio
+async def test_discord_free_response_category_key_admits_unmentioned_journal_channel(adapter, monkeypatch):
+    """One configured category ID admits its child channels without opening a thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "345678901234567890")
+    channel = FakeTextChannel(channel_id=456789012345678901)
+    channel.category_id = 345678901234567890
+    message = make_message(channel=channel, content="Private synthetic journal entry")
+
+    assert await adapter._handle_message(message) is True
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "Private synthetic journal entry"
+    assert event.source.chat_id == str(channel.id)
+    assert event.source.thread_id is None
 
 
 @pytest.mark.asyncio

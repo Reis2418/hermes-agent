@@ -71,7 +71,7 @@ class GatewayInboundHooksMixin:
         from gateway.private_ingress import (
             FAIL_CLOSED_REFUSAL_MESSAGE, match_fail_closed_route, source_route_identity,
         )
-        current_route = match_fail_closed_route(_routes, source)
+        current_route = match_fail_closed_route(_routes, source, event)
         original_route, original_identity = (
             private_origin if private_origin is not None
             else (current_route, source_route_identity(source))

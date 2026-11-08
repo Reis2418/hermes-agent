@@ -55,6 +55,7 @@ FAIL_CLOSED_REFUSAL_MESSAGE = (
 )
 
 _REQUIRED_KEYS = ("platform", "scope_id", "user_id")
+_OPTIONAL_KEYS = ("category_id",)  # Discord category boundary; absent preserves broad legacy route.
 # These surfaces bypass the ordinary external-message _handle_message path:
 # webhook/relay commit native FIFO rows before that handler, api_server owns its
 # own agent lifecycle, and local/MSGraph events are internal. Accepting their
@@ -71,6 +72,7 @@ class FailClosedRoute:
     platform: str
     scope_id: str
     user_id: str
+    category_id: Optional[str] = None
 
     def describe(self) -> str:
         """Stable pseudonymous route label; never log a phone, guild or account ID."""
@@ -111,13 +113,16 @@ def parse_fail_closed_consumer_routes(raw: Any) -> list[FailClosedRoute]:
     routes: list[FailClosedRoute] = []
     for index, entry in enumerate(raw):
         if isinstance(entry, FailClosedRoute):
-            entry = {key: getattr(entry, key) for key in _REQUIRED_KEYS}
+            typed = entry
+            entry = {key: getattr(typed, key) for key in _REQUIRED_KEYS}
+            if typed.category_id is not None:
+                entry["category_id"] = typed.category_id
         if not isinstance(entry, dict):
             raise ValueError(
                 f"gateway.fail_closed_consumer_routes[{index}] must be a dict with "
                 f"{', '.join(_REQUIRED_KEYS)}"
             )
-        extra = sorted(set(entry) - set(_REQUIRED_KEYS))
+        extra = sorted(set(entry) - set(_REQUIRED_KEYS) - set(_OPTIONAL_KEYS))
         if extra:
             raise ValueError(
                 f"gateway.fail_closed_consumer_routes[{index}] has unsupported keys {extra}; "
@@ -138,10 +143,19 @@ def parse_fail_closed_consumer_routes(raw: Any) -> list[FailClosedRoute]:
                 f"gateway.fail_closed_consumer_routes[{index}].platform {platform!r} is unsupported: "
                 "this surface does not pass through the protected external-message admission path"
             )
+        category_id = None
+        if "category_id" in entry:
+            if platform != "discord":
+                raise ValueError(
+                    f"gateway.fail_closed_consumer_routes[{index}].category_id is only supported "
+                    "for Discord routes"
+                )
+            category_id = _exact_id(entry["category_id"], "category_id", index)
         routes.append(FailClosedRoute(
             platform=platform,
             scope_id=_exact_id(entry.get("scope_id"), "scope_id", index),
             user_id=_exact_id(entry.get("user_id"), "user_id", index),
+            category_id=category_id,
         ))
     return routes
 
@@ -154,10 +168,62 @@ def source_route_identity(source: Any) -> tuple:
         getattr(source, "chat_type", None), getattr(source, "thread_id", None),
         getattr(source, "parent_chat_id", None),
         getattr(source, "user_id", None), getattr(source, "profile", None),
+        getattr(source, "discord_category_id", None),
+        getattr(source, "discord_category_pinned", False),
     )
 
 
-def match_fail_closed_route(routes: list[FailClosedRoute], source: Any) -> Optional[FailClosedRoute]:
+def discord_category_of_channel(
+    channel: Any, *, is_thread: bool, parent_chat_id: Optional[str] = None,
+    scope_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a Discord channel at receipt: ID, '' if uncategorized, None if unknown."""
+    if channel is None:
+        return None
+    parent = channel
+    if is_thread:
+        parent = getattr(channel, "parent", None)
+        channel_parent = getattr(channel, "parent_id", None)
+        if parent is None and channel_parent is not None and str(channel_parent) == parent_chat_id:
+            guild = getattr(channel, "guild", None)
+            if (guild is not None and isinstance(parent_chat_id, str)
+                    and parent_chat_id.isdecimal()
+                    and str(getattr(guild, "id", "")) == scope_id):
+                try:
+                    parent = guild.get_channel(int(parent_chat_id))
+                except (AttributeError, TypeError, ValueError):
+                    pass  # Cache miss: the category remains unknown, never ordinary.
+        if parent is None or str(getattr(parent, "id", "")) != parent_chat_id:
+            return None
+    if not hasattr(parent, "category_id"):
+        return None
+    category = parent.category_id
+    return str(category) if category is not None else ""
+
+
+def _discord_category_of(event: Any, source: Any) -> Optional[str]:
+    """Prefer the adapter's receipt-time snapshot; reconstructed sources stay unknown."""
+    if getattr(source, "discord_category_pinned", False):
+        return getattr(source, "discord_category_id", None)
+    channel = getattr(getattr(event, "raw_message", None), "channel", None)
+    channel_id = getattr(channel, "id", None)
+    if channel_id is None:
+        return None
+    channel_id = str(channel_id)
+    parent_id = getattr(source, "parent_chat_id", None)
+    if channel_id == parent_id:
+        return discord_category_of_channel(channel, is_thread=False)  # auto-thread starter
+    if channel_id != getattr(source, "chat_id", None):
+        return None
+    return discord_category_of_channel(
+        channel, is_thread=getattr(source, "chat_type", None) == "thread",
+        parent_chat_id=parent_id, scope_id=getattr(source, "scope_id", None),
+    )
+
+
+def match_fail_closed_route(
+    routes: list[FailClosedRoute], source: Any, event: Any = None,
+) -> Optional[FailClosedRoute]:
     """The exact route matching *source* (original identity), or None.
 
     ``scope_id`` matches the platform-neutral scope (Discord guild / Slack workspace / Signal chat)
@@ -171,9 +237,17 @@ def match_fail_closed_route(routes: list[FailClosedRoute], source: Any) -> Optio
     if not platform or not getattr(source, "user_id", None):
         return None
     scope = getattr(source, "scope_id", None) or getattr(source, "chat_id", None)
+    category = None
     for route in routes:
-        if route.platform == platform and route.user_id == source.user_id and route.scope_id == scope:
-            return route
+        if route.platform != platform or route.user_id != source.user_id or route.scope_id != scope:
+            continue
+        if route.category_id is not None:
+            if category is None:
+                category = _discord_category_of(event, source)
+            if category is not None and category != route.category_id:
+                continue  # Proven to be a different, ordinary Discord category.
+            # Unknown category must refuse for this owner/guild, not fail open.
+        return route
     return None
 
 
