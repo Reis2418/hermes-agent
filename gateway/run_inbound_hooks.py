@@ -62,7 +62,7 @@ class GatewayInboundHooksMixin:
         ingress plugin; the plugin ALONE is not fail-closed and shipping still needs deployment
         review. Internal events are never gated (cron/notifications own their delivery path).
         """
-        if is_internal or getattr(source, "profile_route_rejected", False) is True:
+        if is_internal:
             return None
         # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
         _routes = getattr(getattr(self, "config", None), "fail_closed_consumer_routes", None)
@@ -84,6 +84,11 @@ class GatewayInboundHooksMixin:
         route = original_route or current_route
         if route is None:
             return None
+        if getattr(source, "profile_route_rejected", False) is True:
+            # _hm_admit_event refused canonicalization failures before the
+            # pre-dispatch hook. A hook may mutate this flag afterwards; never
+            # treat that mutable flag as permission to bypass a protected route.
+            return FAIL_CLOSED_REFUSAL_MESSAGE
         _key = getattr(self, "_session_key_for_source", None)
         _key = _key(source) if callable(_key) else None
         _key = _key if isinstance(_key, str) else None

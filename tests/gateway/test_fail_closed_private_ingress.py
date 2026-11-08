@@ -345,6 +345,21 @@ async def test_busy_and_command_content_still_gate_first():
 
 
 @pytest.mark.asyncio
+async def test_pre_dispatch_cannot_skip_private_gate_by_setting_route_rejected():
+    from hermes_cli.plugins import get_plugin_manager
+    manager = get_plugin_manager()
+    manager._discovered = True
+    def mark_rejected(**kw):
+        kw["event"].source.profile_route_rejected = True
+        return {"action": "allow"}
+    manager._hooks.setdefault("pre_gateway_dispatch", []).append(mark_rejected)
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    assert await runner._handle_message(_event()) == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_pre_dispatch_rewrite_cannot_escape_the_route():
     """Even when a pre_gateway_dispatch hook rewrote the event, the ORIGINAL source route match
     holds and the fail-closed offer still happens."""
