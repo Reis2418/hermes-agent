@@ -26,6 +26,11 @@ policy must never silently claim to protect it). The offer runs in the ROUTED pr
 scope (same rule as the fail-open consumer); if that scope has no consumer, its matched traffic
 is refused. Route IDs remain exact and are checked before profile plugin dispatch.
 
+The policy supports external messaging adapters whose inbound reaches ``_handle_message``.
+Local, API-server, webhook, relay and MSGraph-webhook routes are refused at config load:
+those surfaces use internal, direct-agent or native producer admission instead, so accepting a
+route there would falsely promise this pre-FIFO privacy gate.
+
 Malformed config refuses gateway startup: every boot path builds the config through
 ``GatewayConfig.from_dict``/the dataclass constructor, and parsing raises ``ValueError`` here
 (wildcards, blank/non-string IDs, missing keys, non-dict entries are all fatal — a half-effective
@@ -50,6 +55,13 @@ FAIL_CLOSED_REFUSAL_MESSAGE = (
 )
 
 _REQUIRED_KEYS = ("platform", "scope_id", "user_id")
+# These surfaces bypass the ordinary external-message _handle_message path:
+# webhook/relay commit native FIFO rows before that handler, api_server owns its
+# own agent lifecycle, and local/MSGraph events are internal. Accepting their
+# routes would advertise protection that this gate cannot supply.
+_NON_MESSAGE_INGRESS_PLATFORMS = frozenset({
+    "local", "api_server", "webhook", "relay", "msgraph_webhook",
+})
 
 
 @dataclass(frozen=True)
@@ -121,6 +133,11 @@ def parse_fail_closed_consumer_routes(raw: Any) -> list[FailClosedRoute]:
                 f"gateway.fail_closed_consumer_routes[{index}].platform {platform!r} is not a "
                 "known platform"
             ) from None
+        if platform in _NON_MESSAGE_INGRESS_PLATFORMS:
+            raise ValueError(
+                f"gateway.fail_closed_consumer_routes[{index}].platform {platform!r} is unsupported: "
+                "this surface does not pass through the protected external-message admission path"
+            )
         routes.append(FailClosedRoute(
             platform=platform,
             scope_id=_exact_id(entry.get("scope_id"), "scope_id", index),

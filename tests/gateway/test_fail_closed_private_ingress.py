@@ -162,6 +162,16 @@ def test_malformed_yaml_config_refuses_load_gateway_config(tmp_path):
         load_gateway_config()
 
 
+@pytest.mark.parametrize("platform", ["local", "api_server", "webhook", "relay", "msgraph_webhook"])
+def test_non_messaging_ingress_platform_refuses_privacy_policy(platform):
+    # These surfaces do not offer a normal external _handle_message turn
+    # before native admission or agent execution; accepting a rule would
+    # incorrectly claim that its text is protected by this gateway gate.
+    with pytest.raises(ValueError, match="unsupported"):
+        GatewayConfig.from_dict({"fail_closed_consumer_routes": [
+            {"platform": platform, "scope_id": "exact-scope", "user_id": "exact-user"}]})
+
+
 @pytest.mark.asyncio
 async def test_secondary_profile_private_route_policy_is_rejected_at_load(tmp_path, monkeypatch):
     """Only the default gateway owns the route match; a secondary policy may not silently no-op."""
