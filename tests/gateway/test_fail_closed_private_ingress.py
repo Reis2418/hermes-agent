@@ -19,6 +19,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.private_ingress import FAIL_CLOSED_REFUSAL_MESSAGE
+from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_constants import get_hermes_home
 
@@ -38,8 +39,6 @@ def _register(callback) -> None:
 
 
 def _runner(*, routes=None, multiplex=False):
-    from gateway.run import GatewayRunner
-
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(
         platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
@@ -175,7 +174,7 @@ def test_non_messaging_ingress_platform_refuses_privacy_policy(platform):
 @pytest.mark.asyncio
 async def test_secondary_profile_private_route_policy_is_rejected_at_load(tmp_path, monkeypatch):
     """Only the default gateway owns the route match; a secondary policy may not silently no-op."""
-    from gateway.run import GatewayRunner, MultiplexConfigError
+    from gateway.run import MultiplexConfigError
     from gateway import run_startup
     from hermes_cli import env_loader
 
