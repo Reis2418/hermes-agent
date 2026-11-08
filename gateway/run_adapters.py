@@ -1083,6 +1083,15 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             )
             profile_cfg = load_gateway_config()
             violation = _own_policy_open_startup_violation(profile_cfg)
+        if profile_cfg.fail_closed_consumer_routes:
+            # This list is matched only by the default gateway's config at
+            # ingress, before the routed profile's plugin scope is entered.
+            # Parking an unsupported secondary is safer than silently leaving
+            # its purported private route on the ordinary agent path.
+            raise MultiplexConfigError(
+                f"Profile '{profile_name}' sets gateway.fail_closed_consumer_routes. "
+                "Configure these exact routes on the default profile's gateway instead."
+            )
         self._snapshot_profile_busy_modes(profile_name, profile_runtime_cfg)
         if violation:
             raise MultiplexConfigError(

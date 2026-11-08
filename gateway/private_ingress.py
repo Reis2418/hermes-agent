@@ -20,9 +20,11 @@ a prior ``pre_gateway_dispatch`` hook rewrote the event):
 4. A previously-admitted protected message replaying (startup replay or durable-FIFO execution) is
    refused without re-running the hook or the agent.
 
-Routing-profile safety: under multiplexing the offer is made in the ROUTED profile's plugin scope
-(same scope rule as the fail-open consumer). A routed profile with no registered plugin therefore
-refuses its own matched traffic — safe by construction; no unsupported-multiplex overclaim.
+Routing-profile safety: under multiplexing the route list belongs in the DEFAULT gateway profile's
+config. A secondary profile setting its own nonempty list is parked at profile load (an inert
+policy must never silently claim to protect it). The offer runs in the ROUTED profile's plugin
+scope (same rule as the fail-open consumer); if that scope has no consumer, its matched traffic
+is refused. Route IDs remain exact and are checked before profile plugin dispatch.
 
 Malformed config refuses gateway startup: every boot path builds the config through
 ``GatewayConfig.from_dict``/the dataclass constructor, and parsing raises ``ValueError`` here

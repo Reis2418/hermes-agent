@@ -162,6 +162,35 @@ def test_malformed_yaml_config_refuses_load_gateway_config(tmp_path):
         load_gateway_config()
 
 
+@pytest.mark.asyncio
+async def test_secondary_profile_private_route_policy_is_rejected_at_load(tmp_path, monkeypatch):
+    """Only the default gateway owns the route match; a secondary policy may not silently no-op."""
+    from gateway.run import GatewayRunner, MultiplexConfigError
+    from gateway import run_startup
+    from hermes_cli import env_loader
+
+    home = tmp_path / "h"
+    secondary = home / "profiles" / "beta"
+    secondary.mkdir(parents=True)
+    (home / "config.yaml").write_text("gateway:\n  multiplex_profiles: true\n")
+    (secondary / "config.yaml").write_text(
+        "gateway:\n  fail_closed_consumer_routes:\n"
+        f"    - platform: {ROUTE['platform']}\n"
+        f"      scope_id: {ROUTE['scope_id']}\n"
+        f"      user_id: {ROUTE['user_id']}\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(env_loader, "hydrate_profile_secret_sources", lambda _h: None)
+    monkeypatch.setattr(run_startup, "recover_left_core_in", lambda *_a, **_kw: None)
+    runner = object.__new__(GatewayRunner)
+    runner._subscribe_plugin_rewire = MagicMock()
+    runner._register_config_hooks = MagicMock()
+    runner._snapshot_profile_busy_modes = MagicMock()
+
+    with pytest.raises(MultiplexConfigError, match="default profile"):
+        await runner._load_secondary_profile_config("beta", secondary)
+
+
 # ── gate ordering + fail-closed outcomes ───────────────────────────────────────
 
 @pytest.mark.asyncio
