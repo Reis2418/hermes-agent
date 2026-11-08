@@ -1269,6 +1269,17 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         note_busy_admitting(event)
         return True, await admit_message(authority, event)
 
+    async def _hm_pre_turn_gate(
+        self, event: MessageEvent, source: SessionSource, is_internal: bool,
+        private_origin: tuple | None,
+    ) -> Optional[str]:
+        """Stop first, then offer protected ingress, before ordinary dispatch begins."""
+        paused_notice = self._hm_estop_gate(event, source, is_internal)
+        if paused_notice is not None:
+            return paused_notice
+        return await self._hm_fail_closed_private_gate(
+            event, source, is_internal, private_origin)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
@@ -1286,20 +1297,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # calls handle_message directly, so a teardown on the relay's inbound
         # handler left those turns muted.
 
-        _paused_notice = self._hm_estop_gate(event, source, is_internal)
-        if _paused_notice is not None:
-            return _paused_notice
-
-        # FAIL-CLOSED PRIVATE INGRESS (opt-in; gateway.fail_closed_consumer_routes). Matched
-        # authorized routes are offered to post_gateway_admission BEFORE pending approvals, busy
+        # Emergency stop precedes opt-in private ingress. Both run before pending approvals, busy
         # preemption/steering, command/slash dispatch, FIFO admission, transcript append and any
-        # agent/provider; every non-handled outcome is a static refusal, never a fall-through.
-        # Match the source frozen before pre_gateway_dispatch; an earlier hook
-        # cannot redirect a protected message to an unprotected route/profile.
-        _fc_reply = await self._hm_fail_closed_private_gate(
+        # agent/provider. A protected route that is not handled returns a static refusal.
+        # Match the source frozen before pre_gateway_dispatch; a prior hook cannot redirect
+        # a private message to an unprotected route or profile.
+        early_reply = await self._hm_pre_turn_gate(
             event, source, is_internal, private_origin)
-        if _fc_reply is not None:
-            return _fc_reply
+        if early_reply is not None:
+            return early_reply
         if not is_internal:
             from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
             record_gateway_slash_command(event)

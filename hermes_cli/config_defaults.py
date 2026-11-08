@@ -2099,14 +2099,7 @@ DEFAULT_CONFIG = {
         # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
-        # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
-        # connect timed out" loops (many slash commands to sync). 0/negative = wait forever. Bridged
-        # to HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT, which wins if set explicitly.
-        # Seconds the gateway waits for a single messaging platform to finish connecting during startup (and
-        # on reconnect). Discord in particular can blow past the old fixed 30s when an account has many
-        # slash commands to sync (#19776: 90-173 skills → ~28-31s sync). Raise this if your gateway hits
-        # "discord connect timed out" / "Timeout waiting for connection to Discord" restart loops. ``0`` or
-        # negative disables the timeout entirely (wait indefinitely).
+        # Connect timeout per messaging platform; 0/negative waits forever. Explicit env wins.
         "platform_connect_timeout": 30,
         # Event-loop liveness watchdog: a daemon thread probes the asyncio loop; after consecutive
         # missed probes it dumps all-thread stacks and hard-exits with the service-restart code so
@@ -2170,6 +2163,11 @@ DEFAULT_CONFIG = {
         # (gateway/profile_routing.py): [{profile, platform, chat_id|user_id|guild_id|...}].
         # Most-specific match wins; only read by the multiplexing default gateway.
         "profile_routes": [],
+        # Private opt-in exact routes: a matched inbound must be accepted by a
+        # post_gateway_admission consumer or it is refused before ordinary dispatch.
+        # [{platform, scope_id, user_id}], all three concrete IDs required. An
+        # empty list is deliberately inert for existing gateway installations.
+        "fail_closed_consumer_routes": [],
         # Scale-to-zero idle TIMEOUT only. When an instance is opted in via the NAS "Labs" toggle
         # (HERMES_SCALE_TO_ZERO env stamp) AND messaging is relay-only/absent AND a wakeUrl is
         # registered, the relay transport goes dormant so the platform (e.g. Fly autostop) can

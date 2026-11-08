@@ -105,6 +105,11 @@ def _sealed_past_gate(runner):
 # ── config validation: absent → no-op, malformed → refuse startup ──────────────
 
 def test_absent_config_is_a_noop():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    # The CLI registry and presence-sensitive gateway loader must agree:
+    # absent means no policy; a registered empty list does not enable one.
+    assert DEFAULT_CONFIG["gateway"]["fail_closed_consumer_routes"] == []
     cfg = GatewayConfig.from_dict({"platforms": {"whatsapp": {"enabled": True}}})
     assert cfg.fail_closed_consumer_routes == []
 
@@ -375,7 +380,7 @@ async def test_queued_slash_replay_refuses_without_offering_private_hook():
     runner = _runner(routes=[dict(ROUTE)])
     _sealed_past_gate(runner)
     event = _event("/approve token")
-    setattr(event, "_fifo_only", True)
+    vars(event)["_fifo_only"] = True  # replay marker is set dynamically by FIFO dispatch
     assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
     assert calls == []
 
