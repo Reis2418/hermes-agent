@@ -49,7 +49,8 @@ class GatewayInboundHooksMixin:
     """Hook, quick-command and plugin-command dispatch for ``GatewayInboundMixin``."""
 
     async def _hm_fail_closed_private_gate(
-        self, event: MessageEvent, source: SessionSource, is_internal: bool
+        self, event: MessageEvent, source: SessionSource, is_internal: bool,
+        private_origin: tuple | None = None,
     ) -> Optional[str]:
         """Fail-closed private ingress for an opt-in ``gateway.fail_closed_consumer_routes`` match.
 
@@ -67,12 +68,26 @@ class GatewayInboundHooksMixin:
         _routes = getattr(getattr(self, "config", None), "fail_closed_consumer_routes", None)
         if not _routes:
             return None
-        from gateway.private_ingress import match_fail_closed_route, offer_fail_closed_admission
-        route = match_fail_closed_route(_routes, source)
+        from gateway.private_ingress import (
+            FAIL_CLOSED_REFUSAL_MESSAGE, match_fail_closed_route, source_route_identity,
+        )
+        current_route = match_fail_closed_route(_routes, source)
+        original_route, original_identity = (
+            private_origin if private_origin is not None
+            else (current_route, source_route_identity(source))
+        )
+        if (original_route or current_route) and original_identity != source_route_identity(source):
+            # The pre-dispatch hook can mutate event.source in place or swap it
+            # wholesale. Do not offer a protected message to a different profile
+            # or let it escape to an ordinary agent under a different route.
+            return FAIL_CLOSED_REFUSAL_MESSAGE
+        route = original_route or current_route
         if route is None:
             return None
         _key = getattr(self, "_session_key_for_source", None)
         _key = _key(source) if callable(_key) else None
+        _key = _key if isinstance(_key, str) else None
+        from gateway.private_ingress import offer_fail_closed_admission
         _handled, _reply = await offer_fail_closed_admission(self, event, source, _key, route)
         return _reply if _handled else None
 
@@ -113,7 +128,7 @@ class GatewayInboundHooksMixin:
                 session_store=getattr(self, "session_store", None),
             )
         except Exception as _hook_exc:  # health: allow BLE001 -- moved unchanged from run_inbound.py (main has the same handler): a plugin hook must never stop dispatch
-            logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+            logger.warning("pre_gateway_dispatch invocation failed: %s", type(_hook_exc).__name__)
             _hook_results = []
 
         for _result in _hook_results:
@@ -121,11 +136,8 @@ class GatewayInboundHooksMixin:
                 continue
             _action = _result.get("action")
             if _action == "skip":
-                logger.info(
-                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                    _result.get("reason"), source.platform.value if source.platform else "unknown",
-                    source.chat_id or "unknown",
-                )
+                logger.info("pre_gateway_dispatch skip: platform=%s",
+                            source.platform.value if source.platform else "unknown")
                 return None
             if _action == "rewrite":
                 _new_text = _result.get("text")

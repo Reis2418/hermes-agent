@@ -33,6 +33,7 @@ privacy policy is worse than none).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -42,8 +43,8 @@ logger = logging.getLogger(__name__)
 #: Static refusal returned for every refused protected message. Deliberately content-free: it
 #: confirms nothing about the private plugin's state and echoes nothing of the message.
 FAIL_CLOSED_REFUSAL_MESSAGE = (
-    "That message was not processed. Private ingress for this route is unavailable; "
-    "nothing was delivered to the agent."
+    "Private ingress could not confirm handling. Nothing was delivered to the ordinary agent. "
+    "A private consumer may already have saved the message; check its state before retrying."
 )
 
 _REQUIRED_KEYS = ("platform", "scope_id", "user_id")
@@ -58,8 +59,10 @@ class FailClosedRoute:
     user_id: str
 
     def describe(self) -> str:
-        """Non-secret identity of the route for operator logs (never a message body)."""
-        return f"{self.platform}/{self.scope_id}/{self.user_id}"
+        """Stable pseudonymous route label; never log a phone, guild or account ID."""
+        scope = hashlib.sha256(self.scope_id.encode()).hexdigest()[:12]
+        user = hashlib.sha256(self.user_id.encode()).hexdigest()[:12]
+        return f"{self.platform}/{scope}/{user}"
 
 
 def _exact_id(value: Any, key: str, index: int) -> str:
@@ -80,11 +83,11 @@ def _exact_id(value: Any, key: str, index: int) -> str:
 def parse_fail_closed_consumer_routes(raw: Any) -> list[FailClosedRoute]:
     """Validate/coerce the operator list into ``FailClosedRoute``s; raises ``ValueError``.
 
-    Absent/None/empty → ``[]`` (the policy is a no-op, every existing behavior unchanged).
+    Absent → the dataclass default ``[]`` (no-op). An explicit None or wrong shape is malformed.
     Unknown keys are fatal too: a typo'd key (``chat_id``) would silently widen nothing, but it
     means the operator's intent was not parsed — fail loudly rather than half-enforce.
     """
-    if raw is None or raw == []:
+    if raw == []:
         return []
     if not isinstance(raw, list):
         raise ValueError(
@@ -94,8 +97,7 @@ def parse_fail_closed_consumer_routes(raw: Any) -> list[FailClosedRoute]:
     routes: list[FailClosedRoute] = []
     for index, entry in enumerate(raw):
         if isinstance(entry, FailClosedRoute):
-            routes.append(entry)
-            continue
+            entry = {key: getattr(entry, key) for key in _REQUIRED_KEYS}
         if not isinstance(entry, dict):
             raise ValueError(
                 f"gateway.fail_closed_consumer_routes[{index}] must be a dict with "
@@ -123,6 +125,17 @@ def parse_fail_closed_consumer_routes(raw: Any) -> list[FailClosedRoute]:
             user_id=_exact_id(entry.get("user_id"), "user_id", index),
         ))
     return routes
+
+
+def source_route_identity(source: Any) -> tuple:
+    """Freeze routing-critical values before a pre-dispatch hook sees the mutable source."""
+    return (
+        getattr(getattr(source, "platform", None), "value", None),
+        getattr(source, "scope_id", None), getattr(source, "chat_id", None),
+        getattr(source, "chat_type", None), getattr(source, "thread_id", None),
+        getattr(source, "parent_chat_id", None),
+        getattr(source, "user_id", None), getattr(source, "profile", None),
+    )
 
 
 def match_fail_closed_route(routes: list[FailClosedRoute], source: Any) -> Optional[FailClosedRoute]:
@@ -163,9 +176,11 @@ async def offer_fail_closed_admission(
     blank reply, replay, refused profile resolution — returns the static refusal. Only an
     affirmative ``{\"action\": \"handled\", \"reply\": str}`` returns the plugin's own reply."""
     from gateway.session_ingress import executing_admission
-    if executing_admission.get() or getattr(event, "_hermes_startup_restore_replay", False):
-        # A previously-admitted protected row is being (re-)executed. Do NOT re-offer the hook
-        # (it was offered once, at original ingress) and do NOT run the agent: refuse the replay.
+    if (executing_admission.get()
+            or getattr(event, "_hermes_startup_restore_replay", False)
+            or getattr(event, "_fifo_only", False)):
+        # A previously admitted protected row or queued slash is being replayed.
+        # Do not offer it a second time or let it reach the ordinary agent.
         return _refuse("replay of a previously-admitted protected message", route)
 
     try:
@@ -173,7 +188,8 @@ async def offer_fail_closed_admission(
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # health: allow BLE001 -- fail-CLOSED by design: any dispatch/setup error refuses the message
-        logger.warning("fail-closed private ingress: hook dispatch failed (%s)", exc)
+        logger.warning("fail-closed private ingress: hook dispatch failed (%s)",
+                       type(exc).__name__)
         return _refuse("post_gateway_admission dispatch error", route)
 
     if results is None:

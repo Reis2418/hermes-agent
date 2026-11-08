@@ -337,15 +337,20 @@ class PluginDispatchMixin:
         per call; the set is cleared on unload alongside the timeout-suppression map.
         """
         callback_name = getattr(cb, "__name__", repr(cb))
+        private_ingress_hook = hook_name in {"pre_gateway_dispatch", "post_gateway_admission"}
+        # These hooks receive user message text. An exception can embed the
+        # private input, so neither logs nor the dedupe key may retain it.
+        error_label = type(exc).__name__ if private_ingress_hook else str(exc)[:200]
         key = (hook_name, getattr(cb, "__module__", ""), getattr(cb, "__qualname__", callback_name),
-               type(exc).__name__, str(exc)[:200])
+               type(exc).__name__, error_label)
         if key in self._hook_failures_reported:
-            logger.debug("%s '%s' callback %s raised again: %s", surface, hook_name, callback_name, exc)
+            logger.debug("%s '%s' callback %s raised again: %s", surface, hook_name, callback_name,
+                         error_label)
             return
         self._hook_failures_reported.add(key)
         logger.warning(
             "%s '%s' callback %s raised: %s (%s provides: %s; identical failures are logged at DEBUG from now on)",
-            surface, hook_name, callback_name, exc, surface.lower(), ", ".join(sorted(kwargs)) or "no fields")
+            surface, hook_name, callback_name, error_label, surface.lower(), ", ".join(sorted(kwargs)) or "no fields")
 
     def _run_hook_callback_bounded(
         self, hook_name: str, cb: Callable, kwargs: dict[str, Any], timeout: float

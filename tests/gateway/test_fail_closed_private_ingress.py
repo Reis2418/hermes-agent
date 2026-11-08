@@ -119,8 +119,15 @@ def test_valid_config_parses_to_exact_rules():
     assert GatewayConfig.from_dict(cfg.to_dict()).fail_closed_consumer_routes == [rule]
 
 
+def test_programmatic_route_object_cannot_bypass_validation():
+    from gateway.private_ingress import FailClosedRoute
+    with pytest.raises(ValueError):
+        GatewayConfig(fail_closed_consumer_routes=[
+            FailClosedRoute(platform="whatsapp", scope_id="*", user_id="owner")])
+
+
 @pytest.mark.parametrize("bad", [
-    "not-a-list",
+    "not-a-list", None, {}, False, 0, "",
     [{"platform": "whatsapp", "scope_id": "s", "user_id": ""}],        # empty id
     [{"platform": "whatsapp", "scope_id": "   ", "user_id": "u"}],      # whitespace-only id
     [{"platform": "whatsapp", "scope_id": "s"}],                        # missing user_id
@@ -200,6 +207,42 @@ async def test_hook_returning_none_or_unhandled_refuses():
 
 
 @pytest.mark.asyncio
+async def test_pre_dispatch_skip_does_not_log_private_reason_or_route(caplog):
+    from hermes_cli.plugins import get_plugin_manager
+    private_text = "my-private-journal-synthetic-token-409"
+    manager = get_plugin_manager()
+    manager._discovered = True
+    manager._hooks.setdefault("pre_gateway_dispatch", []).append(
+        lambda **_kw: {"action": "skip", "reason": private_text})
+    runner = _runner(routes=[dict(ROUTE)])
+    with caplog.at_level("INFO"):
+        assert await runner._handle_message(_event(private_text)) is None
+    assert private_text not in caplog.text
+    assert ROUTE["user_id"] not in caplog.text
+    assert ROUTE["scope_id"] not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_callback_partial_write_error_does_not_lie_or_log_private_text(caplog):
+    private_text = "my-private-journal-synthetic-token-408"
+    writes = []
+    def committed_then_failed(**kw):
+        writes.append(kw["text"])
+        raise RuntimeError("callback failed after saving " + kw["text"])
+    _register(committed_then_failed)
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    with caplog.at_level("DEBUG"):
+        reply = await runner._handle_message(_event(private_text))
+    assert writes == [private_text]
+    assert reply == FAIL_CLOSED_REFUSAL_MESSAGE
+    assert "may already" in reply
+    assert "not processed" not in reply
+    assert private_text not in caplog.text
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_hook_handled_without_reply_still_refuses_privately():
     _register(lambda **_k: {"action": "handled"})
     runner = _runner(routes=[dict(ROUTE)])
@@ -243,6 +286,19 @@ async def test_callback_timeout_suppression_refuses(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_private_slash_text_never_reaches_shared_command_metrics(monkeypatch):
+    from hermes_cli.observability import shared_metrics_events
+    observed = []
+    monkeypatch.setattr(shared_metrics_events, "record_gateway_slash_command",
+                        lambda event: observed.append(event.text))
+    _register(lambda **_kw: {"action": "handled", "reply": "plugin"})
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    assert await runner._handle_message(_event("/privateword")) == "plugin"
+    assert observed == []
+
+
+@pytest.mark.asyncio
 async def test_busy_and_command_content_still_gate_first():
     """A slash-looking message and a plain approval-shaped 'yes' from a matched route hit the
     gate BEFORE command dispatch and busy preemption."""
@@ -283,6 +339,45 @@ async def test_pre_dispatch_rewrite_cannot_escape_the_route():
         assert fired == ["REWRITTEN"]  # plugin sees the rewritten text; the route still matched
     finally:
         monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["scope_id", "user_id", "profile", "thread_id",
+                                     "parent_chat_id", "chat_type", "source"])
+async def test_original_protected_route_cannot_escape_source_rewrite(changed):
+    from hermes_cli.plugins import get_plugin_manager
+    calls = []
+    manager = get_plugin_manager()
+    manager._discovered = True
+    def rewrite_source(event, **_kwargs):
+        if changed == "source":
+            from dataclasses import replace
+            event.source = replace(event.source, scope_id="other-scope")
+        else:
+            setattr(event.source, changed, "other-scope")
+        return {"action": "allow"}
+    manager._hooks.setdefault("pre_gateway_dispatch", []).append(rewrite_source)
+    _register(lambda **_kw: calls.append("offered") or
+              {"action": "handled", "reply": "plugin"})
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    out = await runner._handle_message(_event())
+    assert out == FAIL_CLOSED_REFUSAL_MESSAGE
+    assert calls == []
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_queued_slash_replay_refuses_without_offering_private_hook():
+    calls = []
+    _register(lambda **_kw: calls.append("offered") or
+              {"action": "handled", "reply": "plugin"})
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    event = _event("/approve token")
+    setattr(event, "_fifo_only", True)
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+    assert calls == []
 
 
 @pytest.mark.asyncio

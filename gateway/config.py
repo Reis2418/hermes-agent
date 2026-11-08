@@ -674,11 +674,9 @@ class GatewayConfig:
 
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
-        if self.fail_closed_consumer_routes:
-            # Validates/coerces operator entries (ValueError refuses startup on any malformed rule).
-            from gateway.private_ingress import parse_fail_closed_consumer_routes
-            self.fail_closed_consumer_routes = parse_fail_closed_consumer_routes(
-                self.fail_closed_consumer_routes)
+        from gateway.private_ingress import parse_fail_closed_consumer_routes
+        self.fail_closed_consumer_routes = parse_fail_closed_consumer_routes(
+            self.fail_closed_consumer_routes)
 
     def get_connected_platforms(self) -> list[Platform]:
         """Enabled + configured platforms, sorted by value so the rendered "Connected
@@ -822,7 +820,8 @@ class GatewayConfig:
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
             fail_closed_consumer_routes=(
                 pick("fail_closed_consumer_routes")
-                if pick("fail_closed_consumer_routes") is not None else []
+                if ("fail_closed_consumer_routes" in data or
+                    "fail_closed_consumer_routes" in nested_gateway) else []
             ),
         )
 

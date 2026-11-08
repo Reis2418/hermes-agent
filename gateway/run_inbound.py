@@ -148,9 +148,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
 
     async def _hm_admit_event(
         self, event: MessageEvent
-    ) -> Optional[tuple[MessageEvent, SessionSource, bool]]:
-        """Ingress gates for ``_handle_message``; None when dropped, else ``(event, source, is_internal)``
-        (the ``pre_gateway_dispatch`` hook may have rewritten ``event``)."""
+    ) -> Optional[tuple[MessageEvent, SessionSource, bool, tuple | None]]:
+        """Ingress gates for ``_handle_message``; None when dropped, else
+        ``(event, source, is_internal, private_origin)``. The origin is frozen
+        before ``pre_gateway_dispatch`` can mutate or replace the source."""
         from gateway.run import _is_slack_ignored_channel
         source = event.source
         # getattr(self, ...) throughout: bare test runners build GatewayRunner via object.__new__.
@@ -197,6 +198,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         ):
             logger.info("Dropping Slack message from configured ignored channel %s", _chat_id)
             return None
+        private_origin = None
+        routes = getattr(_config, "fail_closed_consumer_routes", None)
+        if not is_internal and routes:
+            from gateway.private_ingress import match_fail_closed_route, source_route_identity
+            private_origin = (match_fail_closed_route(routes, source),
+                              source_route_identity(source))
 
         # An admission the authority is executing is already ordered by its durable FIFO; parking it
         # here would settle the row with no turn and replay the input outside it (GW-2).
@@ -211,9 +218,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return None
 
         if is_internal:
-            return event, source, True
+            return event, source, True, private_origin
         if getattr(event, "_fifo_only", False):  # a slash command's queued turn: its command passed ingress
-            return event, source, False
+            return event, source, False, private_origin
 
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
@@ -248,7 +255,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if not getattr(event, "_bot_loop_admitted", False) and not (
                 self._admit_bot_message_for_source(source) and self._admit_bot_chain(event)):
             return None
-        return event, source, False
+        return event, source, False, private_origin
 
     def _hm_estop_turn_allowed(self, event: MessageEvent, source: SessionSource) -> bool:
         """Whether a turn may bypass the global emergency stop: pause blocks NEW agent turns, never
@@ -1269,10 +1276,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None
-        event, source, is_internal = _admitted
-        if not is_internal:
-            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
-            record_gateway_slash_command(event)
+        event, source, is_internal, private_origin = _admitted
         # TERMINAL-DECLINE LATCH TEARDOWN. Deliberately placed AFTER admission,
         # not on the adapter's raw inbound: profile routing, the ignored-channel
         # guard, plugin hooks and user authorization all reject events above,
@@ -1290,11 +1294,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # authorized routes are offered to post_gateway_admission BEFORE pending approvals, busy
         # preemption/steering, command/slash dispatch, FIFO admission, transcript append and any
         # agent/provider; every non-handled outcome is a static refusal, never a fall-through.
-        # Routing is matched on the ORIGINAL source identity even when a pre_gateway_dispatch hook
-        # rewrote the event text (the gate fires before any rewrite can swap source objects).
-        _fc_reply = await self._hm_fail_closed_private_gate(event, source, is_internal)
+        # Match the source frozen before pre_gateway_dispatch; an earlier hook
+        # cannot redirect a protected message to an unprotected route/profile.
+        _fc_reply = await self._hm_fail_closed_private_gate(
+            event, source, is_internal, private_origin)
         if _fc_reply is not None:
             return _fc_reply
+        if not is_internal:
+            from hermes_cli.observability.shared_metrics_events import record_gateway_slash_command
+            record_gateway_slash_command(event)
 
         _quick_key = self._session_key_for_source(source)
         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
