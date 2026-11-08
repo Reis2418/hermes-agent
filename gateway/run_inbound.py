@@ -1286,6 +1286,16 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _paused_notice is not None:
             return _paused_notice
 
+        # FAIL-CLOSED PRIVATE INGRESS (opt-in; gateway.fail_closed_consumer_routes). Matched
+        # authorized routes are offered to post_gateway_admission BEFORE pending approvals, busy
+        # preemption/steering, command/slash dispatch, FIFO admission, transcript append and any
+        # agent/provider; every non-handled outcome is a static refusal, never a fall-through.
+        # Routing is matched on the ORIGINAL source identity even when a pre_gateway_dispatch hook
+        # rewrote the event text (the gate fires before any rewrite can swap source objects).
+        _fc_reply = await self._hm_fail_closed_private_gate(event, source, is_internal)
+        if _fc_reply is not None:
+            return _fc_reply
+
         _quick_key = self._session_key_for_source(source)
         _reply = None if is_internal else await self._hm_pending_reply_intercepts(event, source, _quick_key)
         if _reply is not None:

@@ -1,0 +1,389 @@
+"""Generic opt-in fail-closed private inbound route policy (``gateway.fail_closed_consumer_routes``).
+
+An exact-allowlist of {platform, scope_id, user_id} routes whose inbound messages are offered to
+``post_gateway_admission`` BEFORE pending approvals, busy preemption/steering, command/slash
+dispatch, FIFO admission and any agent turn. If the hook is absent, raises, times out, is
+suppressed or returns nothing handled, the message gets a static refusal and NEVER falls through
+to the ordinary agent. Absent config is a no-op; malformed config refuses gateway startup.
+
+This is a core prerequisite for fail-closed private ingress plugins — the plugin alone is not
+fail-closed without it. Not Journal-specific: no plugin import, no hardcoded profile.
+"""
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent
+from gateway.private_ingress import FAIL_CLOSED_REFUSAL_MESSAGE
+from gateway.session import SessionSource
+from hermes_constants import get_hermes_home
+
+HOOK = "post_gateway_admission"
+
+ROUTE = {"platform": "whatsapp", "scope_id": "155500000000000000@s.whatsapp.net",
+         "user_id": "155500000000000000@s.whatsapp.net"}
+
+
+def _register(callback) -> None:
+    """Register *callback* on the ACTIVE home's plugin manager (what a loaded plugin does)."""
+    from hermes_cli.plugins import get_plugin_manager
+
+    manager = get_plugin_manager()
+    manager._discovered = True  # no on-disk plugins in the test home; skip discovery
+    manager._hooks.setdefault(HOOK, []).append(callback)
+
+
+def _runner(*, routes=None, multiplex=False):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+        multiplex_profiles=multiplex,
+        fail_closed_consumer_routes=routes if routes is not None else [],
+    )
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters = {Platform.WHATSAPP: adapter}
+    runner.pairing_store = MagicMock()
+    runner.session_store = MagicMock()
+    runner._is_user_authorized_for_source = lambda _s: True
+    runner._admit_bot_message_for_source = lambda _s: True
+    runner._delivery_adapter_for = lambda _s: adapter
+    runner._intake_adapter_for = lambda _s: adapter
+    runner._rescue_orphaned_overflow = lambda _k, _a: None
+    runner._enqueue_fifo = MagicMock()
+    runner._handle_message_with_agent = AsyncMock(return_value="agent-ok")
+    runner._run_post_turn_hooks = AsyncMock()
+    runner._session_key_for_source = lambda _s: "agent:main:whatsapp:dm"
+    return runner
+
+
+def _event(text="private journal line", profile=None, scope_id=None, user_id=None,
+           chat_id=None, chat_type="dm"):
+    source = SessionSource(
+        platform=Platform.WHATSAPP,
+        user_id=user_id or ROUTE["user_id"],
+        chat_id=chat_id or ROUTE["scope_id"],
+        scope_id=scope_id if scope_id is not None else ROUTE["scope_id"],
+        user_name="owner", chat_type=chat_type, profile=profile,
+    )
+    return MessageEvent(text=text, message_id="m1", source=source)
+
+
+@pytest.fixture(autouse=True)
+def _allow_all(monkeypatch):
+    for key in ("WHATSAPP_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+
+
+def _sealed_past_gate(runner):
+    """Everything downstream of the fail-closed gate that could reach the agent must trip loudly.
+    The estop gate sits above the fail-closed gate and only ever returns a pause notice (never an
+    agent turn), so it stays a passthrough."""
+    async def _aseal(*_a, **_k):
+        raise AssertionError("private-ingress gate leaked past a downstream stage")
+
+    def _seal(*_a, **_k):
+        raise AssertionError("private-ingress gate leaked past a downstream stage")
+
+    runner._hm_estop_gate = lambda *_a, **_k: None
+    for name in ("_hm_pending_reply_intercepts", "_hm_authority_admission",
+                 "_hm_handle_running_session_message", "_hm_dispatch_idle_commands"):
+        setattr(runner, name, _aseal)
+    runner._claim_active_session_slot = _seal
+    runner._is_session_running = lambda _k: False
+    # If the gate ever falls through, the real agent path is the loudest possible signal.
+    runner._handle_message_with_agent = AsyncMock(side_effect=AssertionError(
+        "fall-through to the agent on a protected route"))
+
+
+# ── config validation: absent → no-op, malformed → refuse startup ──────────────
+
+def test_absent_config_is_a_noop():
+    cfg = GatewayConfig.from_dict({"platforms": {"whatsapp": {"enabled": True}}})
+    assert cfg.fail_closed_consumer_routes == []
+
+
+def test_valid_config_parses_to_exact_rules():
+    cfg = GatewayConfig.from_dict({"fail_closed_consumer_routes": [dict(ROUTE)]})
+    assert len(cfg.fail_closed_consumer_routes) == 1
+    rule = cfg.fail_closed_consumer_routes[0]
+    assert rule.platform == "whatsapp" and rule.scope_id == ROUTE["scope_id"]
+    assert rule.user_id == ROUTE["user_id"]
+    # Round-trips through to_dict for status/export without secrets.
+    assert GatewayConfig.from_dict(cfg.to_dict()).fail_closed_consumer_routes == [rule]
+
+
+@pytest.mark.parametrize("bad", [
+    "not-a-list",
+    [{"platform": "whatsapp", "scope_id": "s", "user_id": ""}],        # empty id
+    [{"platform": "whatsapp", "scope_id": "   ", "user_id": "u"}],      # whitespace-only id
+    [{"platform": "whatsapp", "scope_id": "s"}],                        # missing user_id
+    [{"platform": "*", "scope_id": "s", "user_id": "u"}],               # wildcard platform
+    [{"platform": "whatsapp", "scope_id": "*", "user_id": "u"}],        # wildcard scope
+    [{"platform": "whatsapp", "scope_id": "s", "user_id": "*"}],        # wildcard user
+    ["whatsapp/s/u"],                                                    # not a dict
+    [{"platform": 7, "scope_id": "s", "user_id": "u"}],                  # non-string id
+    [{"platform": "whatsapp", "scope_id": "s", "user_id": "u", "chat_id": "x"}],  # typo'd key
+])
+def test_malformed_config_refuses_gateway_startup(bad):
+    # GatewayConfig.from_dict is the single validation seam the boot path
+    # (load_gateway_config -> GatewayRunner.__init__) uses: an exception there stops the gateway.
+    with pytest.raises(ValueError):
+        GatewayConfig.from_dict({"fail_closed_consumer_routes": bad})
+
+
+def test_malformed_yaml_config_refuses_load_gateway_config(tmp_path):
+    home = tmp_path / "h"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "gateway:\n  fail_closed_consumer_routes: oops\n", encoding="utf-8")
+    from gateway.config import load_gateway_config
+    from gateway.run import _profile_runtime_scope
+
+    with _profile_runtime_scope(home), pytest.raises(ValueError):
+        load_gateway_config()
+
+
+# ── gate ordering + fail-closed outcomes ───────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_plugin_present_and_handled_returns_plugin_reply_before_everything_else():
+    _register(lambda **_k: {"action": "handled", "reply": "journal plugin took it"})
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+
+    out = await runner._handle_message(_event())
+    assert out == "journal plugin took it"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_absent_refuses_and_never_falls_through():
+    runner = _runner(routes=[dict(ROUTE)])  # nothing registered for the hook
+    _sealed_past_gate(runner)
+
+    out = await runner._handle_message(_event())
+    assert out == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_raising_refuses_instead_of_failing_open():
+    def broken(**_k):
+        raise RuntimeError("plugin bug")
+
+    _register(broken)
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+
+    assert await runner._handle_message(_event()) == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_hook_returning_none_or_unhandled_refuses():
+    _register(lambda **_k: None)
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    assert await runner._handle_message(_event()) == FAIL_CLOSED_REFUSAL_MESSAGE
+
+    _register(lambda **_k: {"action": "ignored"})
+    runner2 = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner2)
+    assert await runner2._handle_message(_event("second")) == FAIL_CLOSED_REFUSAL_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_hook_handled_without_reply_still_refuses_privately():
+    _register(lambda **_k: {"action": "handled"})
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    assert await runner._handle_message(_event()) == FAIL_CLOSED_REFUSAL_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_callback_timeout_suppression_refuses(monkeypatch):
+    """The bounded-worker path SKIPS a timed-out/suppressed callback: either an empty result
+    list (skip) or a raised asyncio.TimeoutError (caller-side wait_for cancel). Both must refuse,
+    where the default pipeline would fail open to the agent."""
+    from hermes_cli import lifecycle
+
+    real = lifecycle.ainvoke_hook
+    outcomes = []
+
+    async def timeout_dispatch(name, **kwargs):
+        if name == HOOK:
+            outcomes.append("timed-out")
+            raise TimeoutError()  # the awaited bounded call is cancelled/times out
+        return await real(name, **kwargs)
+
+    _register(lambda **_k: None)  # a consumer IS registered; only its dispatch times out
+    monkeypatch.setattr(lifecycle, "ainvoke_hook", timeout_dispatch)
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    assert await runner._handle_message(_event()) == FAIL_CLOSED_REFUSAL_MESSAGE
+    assert outcomes == ["timed-out"]
+
+    # And the pure-skip shape: hook "ran", collected no result (suppressed) -> refusal, no fall-through.
+    async def suppressed_dispatch(name, **kwargs):
+        if name == HOOK:
+            return []
+        return await real(name, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "ainvoke_hook", suppressed_dispatch)
+    runner2 = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner2)
+    assert await runner2._handle_message(_event("second")) == FAIL_CLOSED_REFUSAL_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_busy_and_command_content_still_gate_first():
+    """A slash-looking message and a plain approval-shaped 'yes' from a matched route hit the
+    gate BEFORE command dispatch and busy preemption."""
+    _register(lambda **_k: {"action": "handled", "reply": "plugin"})
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+
+    assert await runner._handle_message(_event("/approve 12")) == "plugin"
+    assert await runner._handle_message(_event("yes")) == "plugin"
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_rewrite_cannot_escape_the_route():
+    """Even when a pre_gateway_dispatch hook rewrote the event, the ORIGINAL source route match
+    holds and the fail-closed offer still happens."""
+    from hermes_cli import lifecycle
+    from gateway.session_ingress_context import carry_callback
+
+    fired = []
+    _register(lambda **kw: fired.append(kw["text"]) or {"action": "handled", "reply": "plugin"})
+
+    real = lifecycle.ainvoke_hook
+
+    async def patched(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            # Rewrite the text in place on the event the way the real hook chain does.
+            kwargs["event"].text = "REWRITTEN"
+            return [{"action": "allow"}]
+        return await real(name, **kwargs)
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(lifecycle, "ainvoke_hook", patched)
+    try:
+        runner = _runner(routes=[dict(ROUTE)])
+        _sealed_past_gate(runner)
+        out = await runner._handle_message(_event("original private text"))
+        assert out == "plugin"
+        assert fired == ["REWRITTEN"]  # plugin sees the rewritten text; the route still matched
+    finally:
+        monkeypatch.undo()
+
+
+@pytest.mark.asyncio
+async def test_startup_replay_refuses_without_rerunning_hook_or_agent():
+    _register(lambda **_k: pytest.fail("replay must not re-offer the hook"))
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    event = _event()
+    event._hermes_startup_restore_replay = True
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_executing_admission_replay_refuses_without_rerunning_hook():
+    from gateway.session_ingress import executing_admission
+
+    _register(lambda **_k: pytest.fail("executing admission must not re-offer the hook"))
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    token = executing_admission.set(True)
+    try:
+        assert await runner._handle_message(_event()) == FAIL_CLOSED_REFUSAL_MESSAGE
+    finally:
+        executing_admission.reset(token)
+
+
+# ── non-matching traffic keeps default behavior ────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_unmatched_user_on_same_scope_is_ordinary_agent_traffic():
+    _register(lambda **_k: None)  # inert plugin: default fail-open path must reach the agent
+    runner = _runner(routes=[dict(ROUTE)])
+    out = await runner._handle_message(_event(user_id="999@s.whatsapp.net",
+                                              chat_id="999@s.whatsapp.net",
+                                              scope_id="999@s.whatsapp.net"))
+    assert out == "agent-ok"
+
+
+@pytest.mark.asyncio
+async def test_wrong_scope_on_the_same_user_refuses_nothing_and_reaches_agent():
+    runner = _runner(routes=[dict(ROUTE)])
+    out = await runner._handle_message(_event(scope_id="111-other@s.whatsapp.net",
+                                              chat_id="111-other@s.whatsapp.net"))
+    assert out == "agent-ok"
+
+
+@pytest.mark.asyncio
+async def test_matching_route_outside_the_expected_category_still_refuses():
+    """Dedicated single-purpose instance: an exact (platform, scope, user) match outside the
+    plugin's own chat/category is ALSO refused — documented safety trade-off."""
+    runner = _runner(routes=[dict(ROUTE)])
+    _sealed_past_gate(runner)
+    event = _event("random chatter", chat_type="group")
+    assert await runner._handle_message(event) == FAIL_CLOSED_REFUSAL_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_no_routes_configured_keeps_existing_fail_open_behavior():
+    def broken(**_k):
+        raise RuntimeError("plugin bug")
+
+    _register(broken)
+    runner = _runner(routes=[])  # policy absent: untouched v0.23 fail-open semantics
+
+    assert await runner._handle_message(_event()) == "agent-ok"
+
+
+# ── routed-profile safety ──────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_multiplex_matched_route_offers_hook_in_routed_profile_scope(tmp_path):
+    launch, routed = tmp_path / "launch", tmp_path / "profiles" / "beta"
+    launch.mkdir()
+    routed.mkdir(parents=True)
+    fired = []
+
+    from gateway.run import _profile_runtime_scope
+    with _profile_runtime_scope(routed):
+        _register(lambda **_k: fired.append(get_hermes_home()) or
+                  {"action": "handled", "reply": "beta plugin"})
+
+    runner = _runner(routes=[dict(ROUTE)], multiplex=True)
+    runner._resolve_profile_home_for_source = lambda _source: routed
+    _sealed_past_gate(runner)
+    with _profile_runtime_scope(launch):
+        out = await runner._handle_message(_event(profile="beta"))
+    assert out == "beta plugin"
+    assert fired and fired[0] == routed  # offered in the ROUTED profile's plugin scope
+
+
+@pytest.mark.asyncio
+async def test_multiplex_unavailable_hook_in_routed_scope_refuses(tmp_path):
+    launch, routed = tmp_path / "launch", tmp_path / "profiles" / "beta"
+    launch.mkdir()
+    routed.mkdir(parents=True)
+
+    runner = _runner(routes=[dict(ROUTE)], multiplex=True)
+    runner._resolve_profile_home_for_source = lambda _source: routed
+    _sealed_past_gate(runner)
+    from gateway.run import _profile_runtime_scope
+    with _profile_runtime_scope(launch):
+        # beta has no post_gateway_admission plugin registered: refuse, never run the agent.
+        assert await runner._handle_message(_event(profile="beta")) == FAIL_CLOSED_REFUSAL_MESSAGE
+    runner._handle_message_with_agent.assert_not_awaited()

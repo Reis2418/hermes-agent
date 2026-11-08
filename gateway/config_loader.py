@@ -91,6 +91,9 @@ _TOPLEVEL_BRIDGE: tuple = (
     ("multiplex_profiles", "multiplex_profiles", "gwdata", None, None),
     *_presence("room_link_url"),
     ("profile_routes", "profile_routes", "none", lambda v: isinstance(v, list), None),
+    # Fail-closed private ingress: bridge ANY value (even a non-list) so GatewayConfig.from_dict
+    # validates it and REFUSES startup; a silently-skipped privacy key would be a fail-open default.
+    *_presence("fail_closed_consumer_routes"),
     *_presence("max_concurrent_sessions"),
     ("systemd_watchdog_seconds", "systemd_watchdog_seconds", "nested", None, None),
     ("streaming", "streaming", "dict", None, None),

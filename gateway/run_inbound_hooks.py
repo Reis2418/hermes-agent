@@ -48,6 +48,34 @@ async def _stop_exec_tree(proc) -> None:
 class GatewayInboundHooksMixin:
     """Hook, quick-command and plugin-command dispatch for ``GatewayInboundMixin``."""
 
+    async def _hm_fail_closed_private_gate(
+        self, event: MessageEvent, source: SessionSource, is_internal: bool
+    ) -> Optional[str]:
+        """Fail-closed private ingress for an opt-in ``gateway.fail_closed_consumer_routes`` match.
+
+        Returns the reply to send (plugin reply or static refusal) when this message belongs to a
+        protected route, else ``None`` to continue with default (fail-open) dispatch. Never falls
+        through to the agent for a matched route: absence, error, timeout/suppression, an
+        unhandled result or a blank reply all return the static refusal. See
+        ``gateway/private_ingress.py`` — this is an optional core prerequisite for a private
+        ingress plugin; the plugin ALONE is not fail-closed and shipping still needs deployment
+        review. Internal events are never gated (cron/notifications own their delivery path).
+        """
+        if is_internal or getattr(source, "profile_route_rejected", False) is True:
+            return None
+        # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
+        _routes = getattr(getattr(self, "config", None), "fail_closed_consumer_routes", None)
+        if not _routes:
+            return None
+        from gateway.private_ingress import match_fail_closed_route, offer_fail_closed_admission
+        route = match_fail_closed_route(_routes, source)
+        if route is None:
+            return None
+        _key = getattr(self, "_session_key_for_source", None)
+        _key = _key(source) if callable(_key) else None
+        _handled, _reply = await offer_fail_closed_admission(self, event, source, _key, route)
+        return _reply if _handled else None
+
     async def _hm_post_admission_consume(
         self, event: MessageEvent, source: SessionSource, session_key: str
     ) -> tuple[bool, Optional[str]]:

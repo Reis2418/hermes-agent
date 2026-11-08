@@ -639,6 +639,14 @@ class GatewayConfig:
     loop_watchdog_probe_interval_s: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S
     loop_watchdog_probe_timeout_s: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
     loop_watchdog_max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
+    # Opt-in fail-closed private ingress allowlist (``gateway.fail_closed_consumer_routes``): a list
+    # of exact ``{platform, scope_id, user_id}`` dicts (all mandatory, non-empty, no wildcards).
+    # Absent/empty = no-op: ``post_gateway_admission`` keeps its default fail-open semantics. A
+    # matched authorized inbound is offered to the plugin BEFORE approvals/busy/commands/FIFO/agent
+    # and is refused (never agent-delivered) when the plugin is absent, errors, times out or is
+    # suppressed. Malformed entries raise in ``__post_init__`` — every load path (from_dict, the
+    # constructor, restart reloads) therefore refuses gateway startup. See gateway/private_ingress.py.
+    fail_closed_consumer_routes: list = field(default_factory=list)
     # What happens when the LAST messaging adapter goes down. ``exit`` (default) shuts the gateway
     # down with the failure verdict so a supervising service manager (systemd/launchd) restarts it;
     # ``stay_alive`` keeps the process running and leaves recovery to the reconnect watcher — for
@@ -666,6 +674,11 @@ class GatewayConfig:
 
     def __post_init__(self) -> None:
         self.systemd_watchdog_seconds = coerce_systemd_watchdog_seconds(self.systemd_watchdog_seconds)
+        if self.fail_closed_consumer_routes:
+            # Validates/coerces operator entries (ValueError refuses startup on any malformed rule).
+            from gateway.private_ingress import parse_fail_closed_consumer_routes
+            self.fail_closed_consumer_routes = parse_fail_closed_consumer_routes(
+                self.fail_closed_consumer_routes)
 
     def get_connected_platforms(self) -> list[Platform]:
         """Enabled + configured platforms, sorted by value so the rendered "Connected
@@ -701,6 +714,10 @@ class GatewayConfig:
             "quick_commands": self.quick_commands,
             "sessions_dir": str(self.sessions_dir),
             **{name: getattr(self, name) for name in self._SCALAR_DICT_FIELDS},
+            "fail_closed_consumer_routes": [
+                asdict(r) if is_dataclass(r) and not isinstance(r, type) else r
+                for r in self.fail_closed_consumer_routes
+            ],
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -803,6 +820,10 @@ class GatewayConfig:
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=parse_profile_routes(data.get("profile_routes") or []),
+            fail_closed_consumer_routes=(
+                pick("fail_closed_consumer_routes")
+                if pick("fail_closed_consumer_routes") is not None else []
+            ),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
